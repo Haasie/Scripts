@@ -2,7 +2,7 @@
 
 # Script Information
 # Description: Advanced duplicate file finder and remover with efficiency improvements
-# Version: 2.0
+# Version: 2.1
 # Author: Community Contributor
 
 # Set strict error handling
@@ -145,17 +145,18 @@ BEGIN { RS="\0"; FS="\t"; error_count=0 }
 
     if (current_hash == prev_hash) {
         if (!duplicate_group) {
-            files_in_group[0]["ts"] = prev_timestamp
-            files_in_group[0]["file"] = prev_file
+            file_timestamps[0] = prev_timestamp
+            file_paths[0] = prev_file
             duplicate_group = 1
             group_hash = current_hash
         }
-        files_in_group[length(files_in_group)]["ts"] = timestamp
-        files_in_group[length(files_in_group)]["file"] = file
+        file_timestamps[length(file_timestamps)] = timestamp
+        file_paths[length(file_paths)] = file
     } else {
         process_group()
         duplicate_group = 0
-        delete files_in_group
+        delete file_timestamps
+        delete file_paths
         prev_hash = current_hash
         prev_file = file
         prev_timestamp = timestamp
@@ -169,36 +170,36 @@ END {
 
 function get_keep_index(    i, keep_time, keep_index) {
     keep_index = 0
-    for (i in files_in_group) {
-        if (keep_strategy == "oldest" && (i == 0 || files_in_group[i]["ts"] < keep_time)) {
-            keep_time = files_in_group[i]["ts"]
+    for (i in file_timestamps) {
+        if (keep_strategy == "oldest" && (i == 0 || file_timestamps[i] < keep_time)) {
+            keep_time = file_timestamps[i]
             keep_index = i
         }
-        if (keep_strategy == "newest" && (i == 0 || files_in_group[i]["ts"] > keep_time)) {
-            keep_time = files_in_group[i]["ts"]
+        if (keep_strategy == "newest" && (i == 0 || file_timestamps[i] > keep_time)) {
+            keep_time = file_timestamps[i]
             keep_index = i
         }
-        if (keep_strategy == "last") keep_index = length(files_in_group) - 1
+        if (keep_strategy == "last") keep_index = length(file_timestamps) - 1
     }
     return keep_index
 }
 
 function process_group(    i, keep_index, cmd, exit_status, log_entry) {
-    if (length(files_in_group) > 0) {
+    if (length(file_paths) > 0) {
         keep_index = (keep_strategy == "first") ? 0 : get_keep_index()
 
         if (verbose) {
             log_entry = sprintf("\n[DUPLICATES] Group (Hash: %s):\n", group_hash)
-            for (i in files_in_group) {
+            for (i in file_paths) {
                 log_entry = log_entry sprintf("  %s %s\n",
-                    (i == keep_index ? "[KEEP]" : "[DEL]"), files_in_group[i]["file"])
+                    (i == keep_index ? "[KEEP]" : "[DEL]"), file_paths[i])
             }
             system("printf \"%s\" " escape(log_entry) " >> " log_file)
         }
 
-        for (i in files_in_group) {
+        for (i in file_paths) {
             if (i != keep_index) {
-                file_path = files_in_group[i]["file"]
+                file_path = file_paths[i]
                 if (dry_run) {
                     print "Would remove: \"" file_path "\""
                 } else if (auto_delete) {
