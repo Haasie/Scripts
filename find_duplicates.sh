@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Script Information
-# Description: Advanced duplicate file finder and remover
-# Version: 1.1
+# Description: Advanced duplicate file finder and remover with efficiency improvements
+# Version: 2.0
 # Author: Community Contributor
 
 # Set strict error handling
@@ -14,30 +14,40 @@ DRY_RUN=0
 AUTO_DELETE=0
 KEEP_STRATEGY="first"
 MAX_FILE_SIZE=$((100 * 1024 * 1024))  # 100MB default max file size
-HASH_ALGORITHM="md5sum"
-
-# Validate keep strategies
 VALID_STRATEGIES=("first" "last" "oldest" "newest")
 
-# Detect OS and set stat command
+# Detect OS and set commands
 if stat --version >/dev/null 2>&1; then
     STAT_CMD='stat -c %Y'   # GNU/Linux
+    FIND_TS_CMD="%T@"
 else
     STAT_CMD='stat -f %m'   # macOS/BSD
+    FIND_TS_CMD="%m"
 fi
 
-# Usage function
-usage() {
+# Set default hash command
+if command -v md5sum >/dev/null; then
+    HASH_ALGORITHM="md5sum"
+else
+    HASH_ALGORITHM="md5 -r"  # macOS fallback
+fi
+
+# Enhanced help function
+print_help() {
     echo "Usage: $0 [options]"
     echo "Options:"
     echo "  -v, --verbose         Enable verbose output"
     echo "  --dry-run             Simulate file removal without actual deletion"
     echo "  --delete              Automatically delete duplicate files"
-    echo "  --keep STRATEGY       File keeping strategy (first/last/oldest/newest)"
-    echo "  -d DIRECTORY          Target directory for duplicate search"
-    echo "  --max-size SIZE       Maximum file size to process (bytes)"
-    echo "  --hash ALGORITHM      Hash algorithm (md5sum/sha256sum)"
-    exit 1
+    echo "  --keep STRATEGY       File keeping strategy:"
+    echo "                          first - keep first file in sorted order"
+    echo "                          last - keep last file in sorted order"
+    echo "                          oldest - keep file with oldest modification time"
+    echo "                          newest - keep file with newest modification time"
+    echo "  -d DIRECTORY          Target directory for duplicate search (required)"
+    echo "  --max-size SIZE       Maximum file size to process in bytes"
+    echo "  --hash ALGORITHM      Hash algorithm (supports md5sum/sha256sum/etc)"
+    echo "  -h, --help            Show this help message"
 }
 
 # Parse arguments
@@ -55,8 +65,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -d)
-            # Use realpath to resolve and sanitize directory path
-            directory=$(realpath "$2")
+            directory=$(realpath "$2" || echo "$2")
             shift
             ;;
         --max-size)
@@ -67,10 +76,11 @@ while [[ $# -gt 0 ]]; do
             HASH_ALGORITHM="$2"
             shift
             ;;
-        -h|--help) usage ;;
+        -h|--help) print_help; exit 0 ;;
         *)
             echo "Unknown option: $1" >&2
-            usage
+            print_help
+            exit 1
             ;;
     esac
     shift
@@ -87,78 +97,85 @@ if [ -z "${directory:-}" ]; then
     exit 1
 fi
 
-# Additional safety checks
 if [ ! -d "$directory" ]; then
     echo "Error: Directory '$directory' does not exist." >&2
     exit 1
 fi
 
-# Prevent accidental deletion in root or critical system directories
 if [[ "$directory" =~ ^(/|/bin|/etc|/usr|/var|/home)$ ]]; then
     echo "Error: Cannot process files in system-critical directories." >&2
     exit 1
 fi
 
-# Check directory read permissions
 if [ ! -r "$directory" ]; then
     echo "Error: No read permissions for directory '$directory'." >&2
     exit 1
 fi
 
-[ "$VERBOSE" -eq 1 ] && echo "🔍 Scanning directory: $directory"
+if ! command -v "$HASH_ALGORITHM" >/dev/null 2>&1; then
+    echo "Error: Hash command '$HASH_ALGORITHM' not found." >&2
+    exit 1
+fi
+
+[ "$VERBOSE" -eq 1 ] && echo "[INFO] Scanning directory: $directory"
 
 # Temporary files setup
 sorted_tempfile=$(mktemp)
 log_file=$(mktemp)
-
-# Trap to ensure cleanup
 trap 'rm -f "$sorted_tempfile" "$log_file"' EXIT
 
-# File discovery and hashing (handle spaces, limit file size)
-find "$directory" -type f -size -"$MAX_FILE_SIZE"c -print0 | \
-    xargs -0 "$HASH_ALGORITHM" | sort -z > "$sorted_tempfile"
+# File discovery and hashing with timestamps
+[ "$VERBOSE" -eq 1 ] && echo "[INFO] Generating file hashes..."
+find "$directory" -type f -size -"$MAX_FILE_SIZE"c -print0 | while IFS= read -r -d '' file; do
+    timestamp=$($STAT_CMD "$file")
+    hash=$("$HASH_ALGORITHM" "$file" | awk '{print $1}')
+    printf "%s\t%s\t%s\0" "$timestamp" "$hash" "$file"
+done | sort -z -k2 > "$sorted_tempfile"
 
-# Duplicate detection and deletion
+# Duplicate processing with error tracking
 awk -v dry_run="$DRY_RUN" -v auto_delete="$AUTO_DELETE" \
     -v keep_strategy="$KEEP_STRATEGY" -v verbose="$VERBOSE" \
-    -v stat_cmd="$STAT_CMD" -v log_file="$log_file" \
-    -v OFS="\t" -v ORS="\n" '
-BEGIN { RS="\0" }  # Read null-separated records
+    -v log_file="$log_file" -v OFS="\t" -v ORS="\n" '
+BEGIN { RS="\0"; FS="\t"; error_count=0 }
 
 {
-    hash = $1
-    file = substr($0, index($0, $2))  # Preserve full path with spaces
+    timestamp = $1
+    current_hash = $2
+    file = $3
 
-    if (hash == prev_hash) {
+    if (current_hash == prev_hash) {
         if (!duplicate_group) {
-            files_in_group[0] = prev_file
+            files_in_group[0]["ts"] = prev_timestamp
+            files_in_group[0]["file"] = prev_file
             duplicate_group = 1
-            group_hash = hash
+            group_hash = current_hash
         }
-        files_in_group[length(files_in_group)] = file
+        files_in_group[length(files_in_group)]["ts"] = timestamp
+        files_in_group[length(files_in_group)]["file"] = file
     } else {
         process_group()
         duplicate_group = 0
         delete files_in_group
-        prev_hash = hash
+        prev_hash = current_hash
         prev_file = file
+        prev_timestamp = timestamp
     }
 }
-END { process_group() }
 
-function get_keep_index(    i, times, keep_time, keep_index, cmd) {
+END {
+    process_group()
+    exit error_count
+}
+
+function get_keep_index(    i, keep_time, keep_index) {
     keep_index = 0
     for (i in files_in_group) {
-        cmd = stat_cmd " \"" files_in_group[i] "\""
-        cmd | getline times
-        close(cmd)
-
-        if (keep_strategy == "oldest" && (i == 0 || times < keep_time)) {
-            keep_time = times
+        if (keep_strategy == "oldest" && (i == 0 || files_in_group[i]["ts"] < keep_time)) {
+            keep_time = files_in_group[i]["ts"]
             keep_index = i
         }
-        if (keep_strategy == "newest" && (i == 0 || times > keep_time)) {
-            keep_time = times
+        if (keep_strategy == "newest" && (i == 0 || files_in_group[i]["ts"] > keep_time)) {
+            keep_time = files_in_group[i]["ts"]
             keep_index = i
         }
         if (keep_strategy == "last") keep_index = length(files_in_group) - 1
@@ -171,35 +188,50 @@ function process_group(    i, keep_index, cmd, exit_status, log_entry) {
         keep_index = (keep_strategy == "first") ? 0 : get_keep_index()
 
         if (verbose) {
-            log_entry = sprintf("\n🚨 Duplicate group (Hash: %s):\n", group_hash)
+            log_entry = sprintf("\n[DUPLICATES] Group (Hash: %s):\n", group_hash)
             for (i in files_in_group) {
                 log_entry = log_entry sprintf("  %s %s\n",
-                    (i == keep_index ? "[KEEP]" : "[DEL]"), files_in_group[i])
+                    (i == keep_index ? "[KEEP]" : "[DEL]"), files_in_group[i]["file"])
             }
-            system("echo \"" log_entry "\" >> " log_file)
+            system("printf \"%s\" " escape(log_entry) " >> " log_file)
         }
 
         for (i in files_in_group) {
             if (i != keep_index) {
+                file_path = files_in_group[i]["file"]
                 if (dry_run) {
-                    print "Would remove: \"" files_in_group[i] "\""
+                    print "Would remove: \"" file_path "\""
                 } else if (auto_delete) {
-                    cmd = "rm -f -- \"" files_in_group[i] "\""
+                    cmd = "rm -f -- " escape(file_path)
                     exit_status = system(cmd)
-
                     if (exit_status != 0) {
-                        system("echo '❗ Error: Failed to remove \"" files_in_group[i] "\"' >> " log_file)
+                        system("printf \"[ERROR] Failed to remove: %s\\n\" " escape(file_path) " >> " log_file)
+                        error_count++
                     }
                 }
             }
         }
     }
+}
+
+function escape(str) {
+    gsub(/"/, "\\\"", str)
+    return "\"" str "\""
 }' "$sorted_tempfile"
 
-# Final logging and cleanup
+# Handle awk exit status
+awk_exit=$?
+if [ $awk_exit -ne 0 ]; then
+    echo "[WARNING] Some files could not be processed. Check log for details." >&2
+fi
+
+# Final reporting
 if [ "$VERBOSE" -eq 1 ]; then
-    echo -e "\n🧹 Cleaning up temporary files"
-    echo "📄 Detailed log available at: $log_file"
+    echo -e "\n[CLEANUP] Removing temporary files"
+    echo "[INFO] Detailed log available at: $log_file"
+    cat "$log_file"
 else
     rm -f "$log_file"
 fi
+
+exit $awk_exit
